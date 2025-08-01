@@ -21,7 +21,7 @@ class ClaudeService {
 
   async generateUI(
     userId: string,
-    request: GenerateUIRequest
+    request: GenerateUIRequest & { preferred_model?: string }
   ): Promise<GenerateUIResponse> {
     const startTime = Date.now();
     let generationId: string | undefined;
@@ -39,8 +39,8 @@ class ClaudeService {
         throw new Error('AI generation limit exceeded for current billing period');
       }
 
-      // Get the appropriate model for user's tier
-      const model = this.getModelForTier(subscription.tier);
+      // Get the appropriate model for user's tier and preference
+      const model = this.getModelForTier(subscription.tier, request.preferred_model);
 
       // Create the prompt for UI generation
       const prompt = this.createUIPrompt(request);
@@ -134,15 +134,45 @@ class ClaudeService {
     }
   }
 
-  private getModelForTier(tier: string): string {
+  private getModelForTier(tier: string, preferredModel?: string): string {
+    const availableModels = this.getAvailableModelsForTier(tier);
+    
+    // If user specified a preferred model and it's available for their tier, use it
+    if (preferredModel && availableModels.includes(preferredModel)) {
+      return preferredModel;
+    }
+    
+    // Otherwise, use the default model for their tier
     switch (tier) {
       case 'power':
-        return config.claude.models.power;
+        return config.claude.models.power; // Opus by default, but can use any
       case 'pro':
-        return config.claude.models.pro;
+        return config.claude.models.pro; // Sonnet by default, but can use Haiku too
       case 'free':
       default:
-        return config.claude.models.free;
+        return config.claude.models.free; // Haiku only
+    }
+  }
+
+  private getAvailableModelsForTier(tier: string): string[] {
+    switch (tier) {
+      case 'power':
+        // Power users can use all models
+        return [
+          config.claude.models.free,    // Haiku
+          config.claude.models.pro,     // Sonnet
+          config.claude.models.power,   // Opus
+        ];
+      case 'pro':
+        // Pro users can use Haiku and Sonnet
+        return [
+          config.claude.models.free,    // Haiku
+          config.claude.models.pro,     // Sonnet
+        ];
+      case 'free':
+      default:
+        // Free users can only use Haiku
+        return [config.claude.models.free];
     }
   }
 
@@ -305,6 +335,63 @@ Make sure your response is valid JSON that can be parsed programmatically.`;
       return [];
     } catch (error) {
       logger.error('Error fetching user generation history:', error);
+      throw error;
+    }
+  }
+
+  // Get available models for user's subscription tier
+  async getAvailableModelsForUser(userId: string): Promise<{
+    available_models: Array<{
+      id: string;
+      name: string;
+      description: string;
+      speed: 'fast' | 'medium' | 'slow';
+      quality: 'good' | 'better' | 'best';
+      cost_multiplier: number;
+    }>;
+    default_model: string;
+  }> {
+    try {
+      const subscription = await supabase.getUserSubscription(userId);
+      const tier = subscription?.tier || 'free';
+      const availableModelIds = this.getAvailableModelsForTier(tier);
+      
+      const modelInfo = {
+        [config.claude.models.free]: {
+          id: config.claude.models.free,
+          name: 'Haiku',
+          description: 'Fast and efficient model, great for simple UI components',
+          speed: 'fast' as const,
+          quality: 'good' as const,
+          cost_multiplier: 1,
+        },
+        [config.claude.models.pro]: {
+          id: config.claude.models.pro,
+          name: 'Sonnet',
+          description: 'Balanced model with good quality and reasonable speed',
+          speed: 'medium' as const,
+          quality: 'better' as const,
+          cost_multiplier: 15, // 15x more expensive than Haiku
+        },
+        [config.claude.models.power]: {
+          id: config.claude.models.power,
+          name: 'Opus',
+          description: 'Highest quality model for complex and sophisticated UIs',
+          speed: 'slow' as const,
+          quality: 'best' as const,
+          cost_multiplier: 75, // 75x more expensive than Haiku
+        },
+      };
+
+      const availableModels = availableModelIds.map(modelId => modelInfo[modelId]);
+      const defaultModel = this.getModelForTier(tier);
+
+      return {
+        available_models: availableModels,
+        default_model: defaultModel,
+      };
+    } catch (error) {
+      logger.error('Error getting available models for user:', error);
       throw error;
     }
   }

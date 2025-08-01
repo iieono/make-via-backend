@@ -37,6 +37,7 @@ router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res)
         current_period_end: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days from now
         features: {
           ai_generations: 10,
+          ai_models: ['Haiku'],
           max_apps: 1,
           max_screens_per_app: 5,
           support: 'community',
@@ -64,6 +65,7 @@ router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res)
   const features = {
     free: {
       ai_generations: 10,
+      ai_models: ['Haiku'], // Fast, basic model only
       max_apps: 1,
       max_screens_per_app: 5,
       support: 'community',
@@ -73,6 +75,7 @@ router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res)
     },
     pro: {
       ai_generations: 500,
+      ai_models: ['Haiku', 'Sonnet'], // Fast + balanced models
       max_apps: 10,
       max_screens_per_app: 50,
       support: 'email',
@@ -82,6 +85,7 @@ router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res)
     },
     power: {
       ai_generations: 2000,
+      ai_models: ['Haiku', 'Sonnet', 'Opus'], // All models including premium
       max_apps: 100,
       max_screens_per_app: 200,
       support: 'priority',
@@ -333,6 +337,7 @@ router.get('/plans', asyncHandler(async (req, res) => {
       interval: 'month',
       features: {
         ai_generations: 10,
+        ai_models: ['Haiku'],
         max_apps: 1,
         max_screens_per_app: 5,
         support: 'Community',
@@ -351,6 +356,7 @@ router.get('/plans', asyncHandler(async (req, res) => {
       stripe_price_id: process.env.STRIPE_PRO_PRICE_ID,
       features: {
         ai_generations: 500,
+        ai_models: ['Haiku', 'Sonnet'],
         max_apps: 10,
         max_screens_per_app: 50,
         support: 'Email',
@@ -369,6 +375,7 @@ router.get('/plans', asyncHandler(async (req, res) => {
       stripe_price_id: process.env.STRIPE_POWER_PRICE_ID,
       features: {
         ai_generations: 2000,
+        ai_models: ['Haiku', 'Sonnet', 'Opus'],
         max_apps: 100,
         max_screens_per_app: 200,
         support: 'Priority',

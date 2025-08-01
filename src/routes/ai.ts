@@ -23,7 +23,7 @@ router.post('/generate',
   checkUsageLimit('claude_usage'),
   asyncHandler(async (req: AuthenticatedRequest, res) => {
     const user = req.user!;
-    const { prompt, screen_type, app_id, screen_id, context } = req.body;
+    const { prompt, screen_type, app_id, screen_id, context, preferred_model } = req.body;
 
     // Validate required fields
     if (!prompt || typeof prompt !== 'string') {
@@ -66,12 +66,18 @@ router.post('/generate',
       }
     }
 
+    // Validate preferred_model if provided
+    if (preferred_model && typeof preferred_model !== 'string') {
+      throw ValidationError('preferred_model must be a string');
+    }
+
     // Build the generation request
-    const generateRequest: GenerateUIRequest = {
+    const generateRequest: GenerateUIRequest & { preferred_model?: string } = {
       prompt: prompt.trim(),
       screen_type,
       app_id,
       screen_id,
+      preferred_model,
       context: context ? {
         app_name: context.app_name,
         app_type: context.app_type,
@@ -135,6 +141,20 @@ router.get('/can-generate', requireAuth, asyncHandler(async (req: AuthenticatedR
   });
 }));
 
+// Get available AI models for user's subscription tier
+router.get('/models', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
+  const user = req.user!;
+
+  const modelsInfo = await claudeService.getAvailableModelsForUser(user.id);
+
+  res.json({
+    success: true,
+    data: modelsInfo,
+    message: 'Available models retrieved successfully',
+    timestamp: new Date().toISOString(),
+  });
+}));
+
 // Get user's AI generation history
 router.get('/history', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
   const user = req.user!;
@@ -173,7 +193,7 @@ router.post('/regenerate/:screenId',
   asyncHandler(async (req: AuthenticatedRequest, res) => {
     const user = req.user!;
     const { screenId } = req.params;
-    const { prompt, context } = req.body;
+    const { prompt, context, preferred_model } = req.body;
 
     // Get the screen and verify ownership
     const screen = await supabase.getScreenById(screenId);
@@ -193,11 +213,12 @@ router.post('/regenerate/:screenId',
     }
 
     // Build the generation request
-    const generateRequest: GenerateUIRequest = {
+    const generateRequest: GenerateUIRequest & { preferred_model?: string } = {
       prompt: finalPrompt,
       screen_type: screen.screen_type,
       app_id: screen.app_id,
       screen_id: screenId,
+      preferred_model,
       context: context || {
         app_name: app.name,
         app_type: app.metadata?.app_type,

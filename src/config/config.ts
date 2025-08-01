@@ -48,6 +48,11 @@ interface Config {
     maxAiRequests: number;
   };
   
+  // Redis (optional, for rate limiting and caching)
+  redis?: {
+    url: string;
+  };
+  
   // URLs
   urls: {
     frontend: string;
@@ -127,6 +132,11 @@ export const config: Config = {
     maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
     maxAiRequests: parseInt(process.env.RATE_LIMIT_MAX_AI_REQUESTS || '10', 10),
   },
+  
+  // Redis (optional, for rate limiting and caching)
+  redis: process.env.REDIS_URL ? {
+    url: process.env.REDIS_URL,
+  } : undefined,
   
   // URLs
   urls: {

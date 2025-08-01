@@ -10,8 +10,8 @@ import { config } from '@/config/config';
 import { logger } from '@/utils/logger';
 import { errorHandler } from '@/middleware/errorHandler';
 import { notFoundHandler } from '@/middleware/notFoundHandler';
-import { authMiddleware } from '@/middleware/auth';
-import { rateLimitMiddleware } from '@/middleware/rateLimit';
+import { requireAuth } from '@/middleware/auth';
+import rateLimits from '@/middleware/rateLimit';
 
 // Routes
 import authRoutes from '@/routes/auth';
@@ -65,7 +65,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
-app.use(rateLimitMiddleware);
+app.use(rateLimits.general);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -79,11 +79,11 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/subscription', authMiddleware, subscriptionRoutes);
-app.use('/api/stripe', authMiddleware, stripeRoutes);
-app.use('/api/ai', authMiddleware, aiRoutes);
-app.use('/api/apps', authMiddleware, appsRoutes);
-app.use('/api/usage', authMiddleware, usageRoutes);
+app.use('/api/subscription', subscriptionRoutes); // Auth handled in individual routes
+app.use('/api/stripe', stripeRoutes); // Auth handled in individual routes
+app.use('/api/ai', aiRoutes); // Auth handled in individual routes
+app.use('/api/apps', appsRoutes); // Auth handled in individual routes
+app.use('/api/usage', usageRoutes); // Auth handled in individual routes
 app.use('/webhooks', webhookRoutes);
 
 // Error handling
