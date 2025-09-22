@@ -1,268 +1,354 @@
 import { Router } from 'express';
-import { supabase } from '@/services/supabase';
+import { supabaseAuthService } from '@/services/supabase-auth';
+import { userProfileService } from '@/services/user-profile';
 import { logger } from '@/utils/logger';
 import { asyncHandler } from '@/middleware/errorHandler';
-import { requireAuth, optionalAuth } from '@/middleware/auth';
+import { ValidationError } from '@/middleware/errorHandler';
 import rateLimits from '@/middleware/rateLimit';
-import type { AuthenticatedRequest, User } from '@/types';
-import {
-  ValidationError,
-  NotFoundError,
-  AuthenticationError,
-} from '@/middleware/errorHandler';
 
 const router = Router();
 
-// Apply auth rate limiting to all routes
+// Apply rate limiting to auth routes
 router.use(rateLimits.auth);
 
-// Get current user profile
-router.get('/me', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const subscription = req.subscription;
+/**
+ * POST /api/auth/signup
+ * Sign up a new user
+ */
+router.post('/signup',
+  asyncHandler(async (req, res) => {
+    const { email, password, name } = req.body;
 
-  logger.info(`Fetched profile for user: ${user.id}`);
-
-  res.json({
-    success: true,
-    data: {
-      user,
-      subscription,
-    },
-    timestamp: new Date().toISOString(),
-  });
-}));
-
-// Update user profile
-router.patch('/me', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const updates = req.body;
-
-  // Validate allowed fields
-  const allowedFields = ['full_name', 'avatar_url'];
-  const filteredUpdates: Partial<User> = {};
-
-  for (const field of allowedFields) {
-    if (updates[field] !== undefined) {
-      filteredUpdates[field as keyof User] = updates[field];
+    // Validation
+    if (!email || typeof email !== 'string') {
+      throw new ValidationError('Email is required');
     }
-  }
 
-  if (Object.keys(filteredUpdates).length === 0) {
-    throw ValidationError('No valid fields provided for update');
-  }
-
-  // Validate full_name if provided
-  if (filteredUpdates.full_name !== undefined) {
-    if (typeof filteredUpdates.full_name !== 'string') {
-      throw ValidationError('full_name must be a string');
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      throw new ValidationError('Password must be at least 8 characters');
     }
-    if (filteredUpdates.full_name.length < 1 || filteredUpdates.full_name.length > 100) {
-      throw ValidationError('full_name must be between 1 and 100 characters');
+
+    if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+      throw new ValidationError('Invalid email format');
     }
-  }
 
-  // Validate avatar_url if provided
-  if (filteredUpdates.avatar_url !== undefined) {
-    if (typeof filteredUpdates.avatar_url !== 'string') {
-      throw ValidationError('avatar_url must be a string');
+    try {
+      // Sign up with Supabase Auth
+      const session = await supabaseAuthService.signUp(email, password, {
+        name: name || email.split('@')[0],
+      });
+
+      if (!session) {
+        throw new ValidationError('Failed to create account');
+      }
+
+      // Create user profile in our database
+      await userProfileService.updateUserProfile(session.user.id, {
+        name: name || email.split('@')[0],
+        email: email,
+        full_name: name || email.split('@')[0],
+        display_email: email,
+      });
+
+      res.json({
+        success: true,
+        data: {
+          user: session.user,
+          session: {
+            access_token: session.access_token,
+            refresh_token: session.refresh_token,
+            expires_in: session.expires_in,
+          },
+        },
+        message: 'Account created successfully',
+      });
+    } catch (error) {
+      logger.error('Signup error:', error);
+      
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          error: error.name,
+          message: error.message,
+        });
+        return;
+      }
+
+      res.status(500).json({
+        success: false,
+        error: 'server_error',
+        message: 'Failed to create account',
+      });
     }
-    if (filteredUpdates.avatar_url && !isValidUrl(filteredUpdates.avatar_url)) {
-      throw ValidationError('avatar_url must be a valid URL');
+  })
+);
+
+/**
+ * POST /api/auth/signin
+ * Sign in user
+ */
+router.post('/signin',
+  asyncHandler(async (req, res) => {
+    const { email, password } = req.body;
+
+    // Validation
+    if (!email || typeof email !== 'string') {
+      throw new ValidationError('Email is required');
     }
-  }
 
-  const updatedUser = await supabase.updateUser(user.id, filteredUpdates);
+    if (!password || typeof password !== 'string') {
+      throw new ValidationError('Password is required');
+    }
 
-  logger.info(`Updated profile for user: ${user.id}`);
+    try {
+      // Sign in with Supabase Auth
+      const session = await supabaseAuthService.signIn(email, password);
 
-  res.json({
-    success: true,
-    data: updatedUser,
-    message: 'Profile updated successfully',
-    timestamp: new Date().toISOString(),
-  });
-}));
+      if (!session) {
+        throw new ValidationError('Invalid email or password');
+      }
 
-// Complete onboarding
-router.post('/onboarding/complete', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
+      // Update user activity
+      await userProfileService.updateLastActivity(session.user.id);
 
-  if (user.onboarding_completed) {
-    throw ValidationError('Onboarding already completed');
-  }
+      res.json({
+        success: true,
+        data: {
+          user: session.user,
+          session: {
+            access_token: session.access_token,
+            refresh_token: session.refresh_token,
+            expires_in: session.expires_in,
+          },
+        },
+        message: 'Signed in successfully',
+      });
+    } catch (error) {
+      logger.error('Signin error:', error);
+      
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          error: error.name,
+          message: error.message,
+        });
+        return;
+      }
 
-  const updatedUser = await supabase.updateUser(user.id, {
-    onboarding_completed: true,
-  });
+      res.status(401).json({
+        success: false,
+        error: 'invalid_credentials',
+        message: 'Invalid email or password',
+      });
+    }
+  })
+);
 
-  logger.info(`Completed onboarding for user: ${user.id}`);
+/**
+ * POST /api/auth/refresh
+ * Refresh access token
+ */
+router.post('/refresh',
+  asyncHandler(async (req, res) => {
+    const { refresh_token } = req.body;
 
-  res.json({
-    success: true,
-    data: updatedUser,
-    message: 'Onboarding completed successfully',
-    timestamp: new Date().toISOString(),
-  });
-}));
+    if (!refresh_token) {
+      throw new ValidationError('Refresh token is required');
+    }
 
-// Get user statistics
-router.get('/stats', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const subscription = req.subscription;
+    try {
+      const session = await supabaseAuthService.refreshToken(refresh_token);
 
-  // Get user's apps and compute stats
-  const apps = await supabase.getUserApps(user.id, 1000); // Get all apps for stats
-  
-  const stats = {
-    apps: {
-      total: apps.length,
-      draft: apps.filter(app => app.status === 'draft').length,
-      preview: apps.filter(app => app.status === 'preview').length,
-      published: apps.filter(app => app.status === 'published').length,
-    },
-    screens: {
-      total: 0, // Would need to query screens table
-    },
-    usage: {
-      claude_generations_used: subscription?.claude_usage_count || 0,
-      claude_generations_limit: subscription?.claude_usage_limit || 0,
-      tier: subscription?.tier || 'free',
-      period_start: subscription?.current_period_start,
-      period_end: subscription?.current_period_end,
-    },
-    account: {
-      created_at: user.created_at,
-      onboarding_completed: user.onboarding_completed,
-      subscription_tier: user.subscription_tier,
-    },
-  };
+      if (!session) {
+        throw new ValidationError('Invalid refresh token');
+      }
 
-  logger.info(`Fetched stats for user: ${user.id}`);
+      res.json({
+        success: true,
+        data: {
+          access_token: session.access_token,
+          refresh_token: session.refresh_token,
+          expires_in: session.expires_in,
+        },
+        message: 'Token refreshed successfully',
+      });
+    } catch (error) {
+      logger.error('Token refresh error:', error);
+      
+      res.status(401).json({
+        success: false,
+        error: 'invalid_refresh_token',
+        message: 'Invalid or expired refresh token',
+      });
+    }
+  })
+);
 
-  res.json({
-    success: true,
-    data: stats,
-    timestamp: new Date().toISOString(),
-  });
-}));
+/**
+ * POST /api/auth/signout
+ * Sign out user
+ */
+router.post('/signout',
+  asyncHandler(async (req, res) => {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new ValidationError('Invalid authorization header');
+    }
 
-// Refresh user session
-router.post('/refresh', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
+    const token = authHeader.substring(7);
 
-  // Get fresh user data and subscription
-  const [freshUser, freshSubscription] = await Promise.all([
-    supabase.getUserById(user.id),
-    supabase.getUserSubscription(user.id),
-  ]);
+    try {
+      const success = await supabaseAuthService.signOut(token);
 
-  if (!freshUser) {
-    throw NotFoundError('User');
-  }
+      if (!success) {
+        throw new ValidationError('Failed to sign out');
+      }
 
-  logger.info(`Refreshed session for user: ${user.id}`);
+      res.json({
+        success: true,
+        message: 'Signed out successfully',
+      });
+    } catch (error) {
+      logger.error('Signout error:', error);
+      
+      res.status(500).json({
+        success: false,
+        error: 'server_error',
+        message: 'Failed to sign out',
+      });
+    }
+  })
+);
 
-  res.json({
-    success: true,
-    data: {
-      user: freshUser,
-      subscription: freshSubscription,
-    },
-    message: 'Session refreshed successfully',
-    timestamp: new Date().toISOString(),
-  });
-}));
+/**
+ * POST /api/auth/reset-password
+ * Request password reset
+ */
+router.post('/reset-password',
+  asyncHandler(async (req, res) => {
+    const { email } = req.body;
 
-// Delete user account (soft delete)
-router.delete('/me', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const { confirm } = req.body;
+    if (!email || typeof email !== 'string') {
+      throw new ValidationError('Email is required');
+    }
 
-  if (confirm !== 'DELETE_MY_ACCOUNT') {
-    throw ValidationError('Account deletion not confirmed. Please provide confirm: "DELETE_MY_ACCOUNT"');
-  }
+    try {
+      const success = await supabaseAuthService.resetPassword(email);
 
-  // Soft delete user by setting deleted_at timestamp
-  await supabase.updateUser(user.id, {
-    deleted_at: new Date().toISOString(),
-  });
+      if (!success) {
+        throw new ValidationError('Failed to send password reset email');
+      }
 
-  logger.warn(`User account deleted: ${user.id}`);
+      res.json({
+        success: true,
+        message: 'Password reset email sent successfully',
+      });
+    } catch (error) {
+      logger.error('Password reset error:', error);
+      
+      res.status(500).json({
+        success: false,
+        error: 'server_error',
+        message: 'Failed to send password reset email',
+      });
+    }
+  })
+);
 
-  res.json({
-    success: true,
-    message: 'Account deleted successfully',
-    timestamp: new Date().toISOString(),
-  });
-}));
+/**
+ * POST /api/auth/update-password
+ * Update user password
+ */
+router.post('/update-password',
+  asyncHandler(async (req, res) => {
+    const { current_password, new_password } = req.body;
+    const authHeader = req.headers.authorization;
 
-// Check if user exists by email (public endpoint with rate limiting)
-router.post('/check-email', asyncHandler(async (req, res) => {
-  const { email } = req.body;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new ValidationError('Invalid authorization header');
+    }
 
-  if (!email || typeof email !== 'string') {
-    throw ValidationError('Email is required');
-  }
+    const token = authHeader.substring(7);
 
-  if (!isValidEmail(email)) {
-    throw ValidationError('Invalid email format');
-  }
+    if (!current_password || !new_password) {
+      throw new ValidationError('Current password and new password are required');
+    }
 
-  const user = await supabase.getUserByEmail(email.toLowerCase());
-  
-  res.json({
-    success: true,
-    data: {
-      exists: !!user,
-      email: email.toLowerCase(),
-    },
-    timestamp: new Date().toISOString(),
-  });
-}));
+    if (new_password.length < 8) {
+      throw new ValidationError('New password must be at least 8 characters');
+    }
 
-// Get public user profile (for sharing/collaboration features)
-router.get('/public/:userId', optionalAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const { userId } = req.params;
+    try {
+      // First verify current password by attempting to sign in
+      const user = await supabaseAuthService.verifyToken(token);
+      if (!user) {
+        throw new ValidationError('Invalid user token');
+      }
 
-  if (!userId) {
-    throw ValidationError('User ID is required');
-  }
+      // Update password
+      const success = await supabaseAuthService.updatePassword(token, new_password);
 
-  const user = await supabase.getUserById(userId);
-  
-  if (!user) {
-    throw NotFoundError('User');
-  }
+      if (!success) {
+        throw new ValidationError('Failed to update password');
+      }
 
-  // Return only public information
-  const publicProfile = {
-    id: user.id,
-    full_name: user.full_name,
-    avatar_url: user.avatar_url,
-    created_at: user.created_at,
-  };
+      res.json({
+        success: true,
+        message: 'Password updated successfully',
+      });
+    } catch (error) {
+      logger.error('Password update error:', error);
+      
+      res.status(400).json({
+        success: false,
+        error: 'password_update_failed',
+        message: 'Failed to update password',
+      });
+    }
+  })
+);
 
-  res.json({
-    success: true,
-    data: publicProfile,
-    timestamp: new Date().toISOString(),
-  });
-}));
+/**
+ * GET /api/auth/me
+ * Get current user info
+ */
+router.get('/me',
+  asyncHandler(async (req, res) => {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new ValidationError('Invalid authorization header');
+    }
 
-// Helper functions
-function isValidEmail(email: string): boolean {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
+    const token = authHeader.substring(7);
 
-function isValidUrl(url: string): boolean {
-  try {
-    new URL(url);
-    return true;
-  } catch {
-    return false;
-  }
-}
+    try {
+      const user = await supabaseAuthService.verifyToken(token);
+
+      if (!user) {
+        throw new ValidationError('Invalid token');
+      }
+
+      const profile = await userProfileService.getUserProfile(user.id);
+
+      res.json({
+        success: true,
+        data: {
+          user,
+          profile,
+        },
+      });
+    } catch (error) {
+      logger.error('Get user info error:', error);
+      
+      res.status(401).json({
+        success: false,
+        error: 'invalid_token',
+        message: 'Invalid or expired token',
+      });
+    }
+  })
+);
 
 export default router;

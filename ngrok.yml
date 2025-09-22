@@ -1,0 +1,10 @@
+version: "2"
+authtoken: "30frtoDykWX4lhrs7U2esloEcMi_4JXxkV77b2thSUgdgQLgh"
+tunnels:
+  makevia:
+    proto: http
+    addr: 3000
+    domain: "worthy-bass-radically.ngrok-free.app"
+    schemes:
+      - https
+    inspect: false

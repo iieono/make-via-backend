@@ -1,254 +1,725 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { supabase } from '@/services/supabase';
+import { fileService } from '@/services/files';
 import { logger } from '@/utils/logger';
 import { asyncHandler } from '@/middleware/errorHandler';
-import { requireAuth, requireOwnership, optionalAuth } from '@/middleware/auth';
+import { requireAuth } from '@/middleware/auth';
 import rateLimits from '@/middleware/rateLimit';
-import type { AuthenticatedRequest, App, Screen } from '@/types';
-import {
-  ValidationError,
-  NotFoundError,
-  ConflictError,
-} from '@/middleware/errorHandler';
+import type { 
+  CreateAppRequest, 
+  UpdateAppRequest, 
+  AppConfig, 
+  AppContext 
+} from '@/types/app-development';
 
 const router = Router();
 
-// Apply general rate limiting to all routes
-router.use(rateLimits.general);
-
-// Get user's apps
-router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const { page = 1, limit = 20, status, search } = req.query;
-
-  // Validate pagination parameters
-  const parsedPage = Math.max(parseInt(page as string) || 1, 1);
-  const parsedLimit = Math.min(Math.max(parseInt(limit as string) || 20, 1), 100);
-  const offset = (parsedPage - 1) * parsedLimit;
-
-  let apps = await supabase.getUserApps(user.id, parsedLimit, offset);
-
-  // Filter by status if provided
-  if (status && typeof status === 'string') {
-    const validStatuses = ['draft', 'preview', 'published', 'archived'];
-    if (validStatuses.includes(status)) {
-      apps = apps.filter(app => app.status === status);
-    }
-  }
-
-  // Filter by search term if provided
-  if (search && typeof search === 'string') {
-    const searchTerm = search.toLowerCase();
-    apps = apps.filter(app => 
-      app.name.toLowerCase().includes(searchTerm) ||
-      app.description?.toLowerCase().includes(searchTerm)
+// Configure multer for app icon uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit for app icons
+    files: 1,
+  },
+  fileFilter: (req, file, cb) => {
+    // Log file info for debugging
+    logger.info(`File upload - Name: ${file.originalname}, MIME: ${file.mimetype}, Field: ${file.fieldname}`);
+    
+    // Accept image files and common icon formats
+    const allowedMimes = [
+      'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+      'image/svg+xml', 'image/bmp', 'image/tiff',
+      'application/octet-stream' // Sometimes images are sent as this
+    ];
+    
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico'];
+    
+    const hasValidMime = file.mimetype.startsWith('image/') || allowedMimes.includes(file.mimetype);
+    const hasValidExtension = allowedExtensions.some(ext => 
+      file.originalname.toLowerCase().endsWith(ext)
     );
-  }
+    
+    if (hasValidMime || hasValidExtension) {
+      cb(null, true);
+    } else {
+      logger.error(`Invalid file type - MIME: ${file.mimetype}, Name: ${file.originalname}`);
+      cb(new Error('Only image files are allowed for app icons'));
+    }
+  },
+});
 
-  res.json({
-    success: true,
-    data: apps,
-    pagination: {
-      page: parsedPage,
-      limit: parsedLimit,
-      total: apps.length, // This would need actual total count from database
-      pages: Math.ceil(apps.length / parsedLimit),
-    },
-    timestamp: new Date().toISOString(),
-  });
-}));
+// Apply authentication to all routes
+router.use(requireAuth);
 
-// Create new app
-router.post('/', 
-  requireAuth,
-  rateLimits.appCreation,
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { name, description, app_type, primary_color, package_name } = req.body;
+/**
+ * GET /api/apps
+ * Get all apps for the authenticated user
+ */
+router.get('/', 
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { status, limit = 50, offset = 0 } = req.query;
 
-    // Validate required fields
-    if (!name || typeof name !== 'string') {
-      throw ValidationError('App name is required');
+    let query = supabase.serviceClient
+      .from('apps')
+      .select(`
+        *,
+        app_templates(name, category),
+        _count_pages:app_pages(count),
+        _count_collaborators:app_collaborators(count)
+      `)
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false });
+
+    if (status) {
+      query = query.eq('status', status);
     }
 
-    if (name.length < 1 || name.length > 100) {
-      throw ValidationError('App name must be between 1 and 100 characters');
-    }
+    query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
 
-    // Validate optional fields
-    if (description && (typeof description !== 'string' || description.length > 500)) {
-      throw ValidationError('Description must be a string with max 500 characters');
-    }
+    const { data: apps, error, count } = await query;
 
-    if (app_type && !['social', 'ecommerce', 'productivity', 'utility', 'game', 'other'].includes(app_type)) {
-      throw ValidationError('Invalid app type');
-    }
-
-    if (primary_color && (typeof primary_color !== 'string' || !isValidHexColor(primary_color))) {
-      throw ValidationError('Primary color must be a valid hex color');
-    }
-
-    if (package_name && (typeof package_name !== 'string' || !isValidPackageName(package_name))) {
-      throw ValidationError('Invalid package name format');
-    }
-
-    // Check user's app limit
-    const userApps = await supabase.getUserApps(user.id, 1000);
-    const subscription = req.subscription;
-    const appLimit = subscription?.apps_limit || 1; // Free tier limit
-
-    if (userApps.length >= appLimit) {
-      throw ConflictError(`App limit reached. Your ${subscription?.tier || 'free'} plan allows ${appLimit} apps.`);
-    }
-
-    const appData: Omit<App, 'id' | 'created_at' | 'updated_at'> = {
-      user_id: user.id,
-      name: name.trim(),
-      description: description?.trim(),
-      package_name: package_name || generatePackageName(name),
-      version: '1.0.0',
-      status: 'draft',
-      primary_color: primary_color || '#2196F3',
-      theme_mode: 'system',
-      config: {
-        app_type: app_type || 'other',
-        target_sdk: 34,
-        min_sdk: 21,
-      },
-      metadata: {
-        app_type: app_type || 'other',
-        created_by: user.id,
-        created_from: 'api',
-      },
-      preview_count: 0,
-      build_count: 0,
-      is_public: false,
-      sharing_enabled: false,
-      visibility: 'private',
-    };
-
-    const newApp = await supabase.createApp(appData);
-
-    logger.info(`Created new app for user ${user.id}: ${newApp.id}`);
-
-    res.status(201).json({
-      success: true,
-      data: newApp,
-      message: 'App created successfully',
-      timestamp: new Date().toISOString(),
-    });
-  })
-);
-
-// Get specific app
-router.get('/:id', 
-  requireAuth,
-  requireOwnership('app'),
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { id } = req.params;
-    const { include_screens } = req.query;
-
-    const app = await supabase.getAppById(id, user.id);
-    if (!app) {
-      throw NotFoundError('App');
-    }
-
-    let screens: Screen[] = [];
-    if (include_screens === 'true') {
-      screens = await supabase.getAppScreens(id);
+    if (error) {
+      logger.error('Error fetching apps:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch apps',
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
     res.json({
       success: true,
-      data: {
-        ...app,
-        ...(include_screens === 'true' && { screens }),
+      data: apps,
+      pagination: {
+        total: count,
+        limit: Number(limit),
+        offset: Number(offset),
       },
       timestamp: new Date().toISOString(),
     });
   })
 );
 
-// Update app
-router.patch('/:id',
-  requireAuth,
-  requireOwnership('app'),
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { id } = req.params;
-    const updates = req.body;
+/**
+ * GET /api/apps/:id
+ * Get a specific app by ID
+ */
+router.get('/:id',
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: appId } = req.params;
 
-    // Validate allowed fields
-    const allowedFields = [
-      'name', 'description', 'primary_color', 'theme_mode', 
-      'config', 'metadata', 'is_public', 'sharing_enabled', 'visibility'
-    ];
+    // First check if user owns the app directly
+    const { data: app, error } = await supabase.serviceClient
+      .from('apps')
+      .select(`
+        *,
+        app_templates(*),
+        app_dependencies(*),
+        github_repositories(*)
+      `)
+      .eq('id', appId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !app) {
+      res.status(404).json({
+        success: false,
+        error: 'App not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: app,
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+/**
+ * GET /api/apps/:id/full-context
+ * Get complete app context for AI prompting
+ */
+router.get('/:id/full-context',
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: appId } = req.params;
+
+    // Get app with all related data
+    const { data: app, error: appError } = await supabase.serviceClient
+      .from('apps')
+      .select('*')
+      .eq('id', appId)
+      .or(`user_id.eq.${userId},app_collaborators.user_id.eq.${userId}`)
+      .single();
+
+    if (appError || !app) {
+      res.status(404).json({
+        success: false,
+        error: 'App not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Get all pages
+    const { data: pages } = await supabase.serviceClient
+      .from('app_pages')
+      .select('*')
+      .eq('app_id', appId)
+      .order('created_at');
+
+    // Get all components
+    const { data: components } = await supabase.serviceClient
+      .from('page_components')
+      .select(`
+        *,
+        app_pages!inner(app_id)
+      `)
+      .eq('app_pages.app_id', appId);
+
+    // Get recent activity
+    const { data: activity } = await supabase.serviceClient
+      .from('app_activity_log')
+      .select('*')
+      .eq('app_id', appId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    // Get dependencies
+    const { data: dependencies } = await supabase.serviceClient
+      .from('app_dependencies')
+      .select('*')
+      .eq('app_id', appId)
+      .eq('is_active', true);
+
+    const context: AppContext = {
+      app: app as AppConfig,
+      all_pages: pages || [],
+      all_components: components || [],
+      recent_activity: activity || [],
+      dependencies: dependencies || [],
+    };
+
+    res.json({
+      success: true,
+      data: context,
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+/**
+ * POST /api/apps
+ * Create a new app (supports both JSON and multipart form data with app icon)
+ */
+router.post('/',
+  rateLimits.api,
+  upload.single('file'), // Handle optional app icon upload (Flutter sends as 'file')
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
     
-    const filteredUpdates: Partial<App> = {};
-    for (const field of allowedFields) {
-      if (updates[field] !== undefined) {
-        filteredUpdates[field as keyof App] = updates[field];
+    // Handle both JSON and form data
+    let requestData: CreateAppRequest;
+    
+    // Handle both JSON and form data (multer parses form data into req.body)
+    requestData = {
+      name: req.body.name,
+      description: req.body.description,
+      package_name: req.body.package_name,
+      primary_color: req.body.primary_color,
+      accent_color: req.body.accent_color,
+      theme_mode: req.body.theme_mode,
+      target_platforms: req.body.target_platforms ? 
+        (Array.isArray(req.body.target_platforms) ? req.body.target_platforms : req.body.target_platforms.split(',')) : 
+        undefined,
+      min_sdk_version: req.body.min_sdk_version ? parseInt(req.body.min_sdk_version) : undefined,
+      target_sdk_version: req.body.target_sdk_version ? parseInt(req.body.target_sdk_version) : undefined,
+      version_name: req.body.version_name,
+      version_code: req.body.version_code ? parseInt(req.body.version_code) : undefined,
+      tags: req.body.tags ? 
+        (Array.isArray(req.body.tags) ? req.body.tags : req.body.tags.split(',')) : 
+        undefined,
+      metadata: req.body.metadata ? 
+        (typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata) : 
+        undefined,
+    };
+
+    // Validate required fields
+    if (!requestData.name) {
+      res.status(400).json({
+        success: false,
+        error: 'App name is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Generate package name if not provided
+    const packageName = requestData.package_name || 
+      `com.makevia.${requestData.name.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+
+    // Handle app icon upload if provided
+    let appIconUrl = requestData.app_icon_url;
+    let uploadedFileId: string | null = null;
+    if (req.file) {
+      try {
+        const uploadedFile = await fileService.uploadFile(
+          userId,
+          {
+            buffer: req.file.buffer,
+            originalName: req.file.originalname,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+          },
+          {
+            file_type: 'icon',
+            metadata: {
+              description: `App icon for ${requestData.name}`,
+            },
+          }
+        );
+        appIconUrl = uploadedFile.public_url;
+        uploadedFileId = uploadedFile.id;
+        logger.info(`App icon uploaded successfully: ${uploadedFile.public_url}`);
+      } catch (uploadError) {
+        logger.error('Error uploading app icon:', uploadError);
+        res.status(500).json({
+          success: false,
+          error: `Failed to upload app icon`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
       }
     }
 
-    if (Object.keys(filteredUpdates).length === 0) {
-      throw ValidationError('No valid fields provided for update');
+    const appData = {
+      user_id: userId,
+      name: requestData.name,
+      description: requestData.description,
+      package_name: packageName,
+      template_id: requestData.template_id,
+      app_icon_url: appIconUrl,
+      primary_color: requestData.primary_color || '#2196F3',
+      accent_color: requestData.accent_color || '#FF4081',
+      theme_mode: requestData.theme_mode || 'system',
+      target_platforms: requestData.target_platforms || ['android', 'ios'],
+      min_sdk_version: requestData.min_sdk_version || 21,
+      target_sdk_version: requestData.target_sdk_version || 34,
+      version_name: requestData.version_name || '1.0.0',
+      version_code: requestData.version_code || 1,
+      tags: requestData.tags || [],
+      metadata: requestData.metadata || {},
+      status: 'draft' as const,
+    };
+
+    const { data: app, error } = await supabase.serviceClient
+      .from('apps')
+      .insert(appData)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Error creating app:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to create app',
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
-    // Validate individual fields
-    if (filteredUpdates.name) {
-      if (typeof filteredUpdates.name !== 'string' || 
-          filteredUpdates.name.length < 1 || 
-          filteredUpdates.name.length > 100) {
-        throw ValidationError('App name must be between 1 and 100 characters');
+    // Create default home page
+    await supabase.serviceClient
+      .from('app_pages')
+      .insert({
+        app_id: app.id,
+        name: 'Home',
+        title: 'Home',
+        route_path: '/',
+        page_type: 'home',
+        is_home_page: true,
+      });
+
+    // Update file record with app_id if we uploaded an icon
+    if (uploadedFileId) {
+      try {
+        await supabase.serviceClient
+          .from('file_uploads')
+          .update({ app_id: app.id })
+          .eq('id', uploadedFileId);
+        logger.info(`Updated file record ${uploadedFileId} with app_id ${app.id}`);
+      } catch (fileUpdateError) {
+        logger.warn('Failed to update file record with app_id:', fileUpdateError);
+        // Don't fail the app creation for this
       }
     }
 
-    if (filteredUpdates.primary_color && !isValidHexColor(filteredUpdates.primary_color)) {
-      throw ValidationError('Primary color must be a valid hex color');
+    // Log activity
+    await supabase.serviceClient
+      .from('app_activity_log')
+      .insert({
+        app_id: app.id,
+        user_id: userId,
+        action_type: 'app_created',
+        action_description: `Created new app: ${app.name}`,
+        after_state: app,
+      });
+
+    res.status(201).json({
+      success: true,
+      data: app,
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+/**
+ * PUT /api/apps/:id
+ * Update an app
+ */
+router.put('/:id',
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: appId } = req.params;
+    const updateData: UpdateAppRequest = req.body;
+
+    // Verify app ownership or collaboration
+    const { data: app, error: fetchError } = await supabase.serviceClient
+      .from('apps')
+      .select('*')
+      .eq('id', appId)
+      .or(`user_id.eq.${userId},app_collaborators.user_id.eq.${userId}`)
+      .single();
+
+    if (fetchError || !app) {
+      res.status(404).json({
+        success: false,
+        error: 'App not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
-    if (filteredUpdates.theme_mode && !['light', 'dark', 'system'].includes(filteredUpdates.theme_mode)) {
-      throw ValidationError('Theme mode must be light, dark, or system');
+    const { data: updatedApp, error } = await supabase.serviceClient
+      .from('apps')
+      .update({
+        ...updateData,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', appId)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Error updating app:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to update app',
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
-    if (filteredUpdates.visibility && !['private', 'organization', 'public'].includes(filteredUpdates.visibility)) {
-      throw ValidationError('Visibility must be private, organization, or public');
-    }
-
-    const updatedApp = await supabase.updateApp(id, filteredUpdates);
-
-    logger.info(`Updated app ${id} for user ${user.id}`);
+    // Log activity
+    await supabase.serviceClient
+      .from('app_activity_log')
+      .insert({
+        app_id: appId,
+        user_id: userId,
+        action_type: 'app_updated',
+        action_description: `Updated app configuration`,
+        before_state: app,
+        after_state: updatedApp,
+      });
 
     res.json({
       success: true,
       data: updatedApp,
-      message: 'App updated successfully',
       timestamp: new Date().toISOString(),
     });
   })
 );
 
-// Delete app (soft delete)
-router.delete('/:id',
-  requireAuth,
-  requireOwnership('app'),
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { id } = req.params;
-    const { confirm } = req.body;
+/**
+ * POST /api/apps/:id/update-with-icon
+ * Update an app with icon upload
+ */
+router.post('/:id/update-with-icon',
+  rateLimits.api,
+  upload.single('file'),
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: appId } = req.params;
 
-    if (confirm !== 'DELETE_APP') {
-      throw ValidationError('App deletion not confirmed. Please provide confirm: "DELETE_APP"');
+    // Parse multipart form data
+    const requestData = parseFormData(req.body);
+    
+    logger.info(`Update app with icon - App: ${appId}, User: ${userId}`);
+    logger.info('Form data:', JSON.stringify(requestData, null, 2));
+    
+    // Verify app ownership
+    const { data: app, error: fetchError } = await supabase.serviceClient
+      .from('apps')
+      .select('*')
+      .eq('id', appId)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchError || !app) {
+      res.status(404).json({
+        success: false,
+        error: 'App not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
-    await supabase.updateApp(id, {
-      deleted_at: new Date().toISOString(),
-      status: 'archived',
+    // Handle app icon upload if provided
+    let appIconUrl = app.app_icon_url;
+    let uploadedFileId: string | null = null;
+    if (req.file) {
+      try {
+        const uploadedFile = await fileService.uploadFile(
+          userId,
+          {
+            buffer: req.file.buffer,
+            originalName: req.file.originalname,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+          },
+          {
+            file_type: 'icon',
+            metadata: {
+              description: `Updated app icon for ${requestData.name || app.name}`,
+            },
+          }
+        );
+        appIconUrl = uploadedFile.public_url;
+        uploadedFileId = uploadedFile.id;
+        logger.info(`App icon updated successfully: ${uploadedFile.public_url}`);
+      } catch (uploadError) {
+        logger.error('Error uploading app icon:', uploadError);
+        res.status(500).json({
+          success: false,
+          error: `Failed to upload app icon`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
+    // Prepare update data
+    const updateData: any = {
+      ...requestData,
+      app_icon_url: appIconUrl,
+      updated_at: new Date().toISOString(),
+    };
+
+    // Remove undefined values
+    Object.keys(updateData).forEach(key => {
+      if (updateData[key] === undefined || updateData[key] === '') {
+        delete updateData[key];
+      }
     });
 
-    logger.warn(`Deleted app ${id} for user ${user.id}`);
+    // Update the app
+    const { data: updatedApp, error } = await supabase.serviceClient
+      .from('apps')
+      .update(updateData)
+      .eq('id', appId)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Error updating app:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to update app',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Update file record with app_id if we uploaded an icon
+    if (uploadedFileId) {
+      try {
+        await supabase.serviceClient
+          .from('file_uploads')
+          .update({ app_id: appId })
+          .eq('id', uploadedFileId);
+        logger.info(`Updated file record ${uploadedFileId} with app_id ${appId}`);
+      } catch (fileUpdateError) {
+        logger.warn('Failed to update file record with app_id:', fileUpdateError);
+        // Don't fail the app update for this
+      }
+    }
+
+    // Log activity
+    await supabase.serviceClient
+      .from('app_activity_log')
+      .insert({
+        app_id: appId,
+        user_id: userId,
+        action: 'app_updated',
+        description: `App "${updatedApp.name}" was updated`,
+        metadata: { 
+          updated_fields: Object.keys(requestData),
+          icon_updated: !!req.file,
+        },
+      });
+
+    res.json({
+      success: true,
+      data: updatedApp,
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+/**
+ * POST /api/apps/:id/clone
+ * Clone an existing app
+ */
+router.post('/:id/clone',
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: sourceAppId } = req.params;
+    const { name } = req.body;
+
+    if (!name) {
+      res.status(400).json({
+        success: false,
+        error: 'New app name is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Get source app
+    const { data: sourceApp, error: sourceError } = await supabase.serviceClient
+      .from('apps')
+      .select('*')
+      .eq('id', sourceAppId)
+      .single();
+
+    if (sourceError || !sourceApp) {
+      res.status(404).json({
+        success: false,
+        error: 'Source app not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Create cloned app
+    const clonedAppData = {
+      ...sourceApp,
+      id: undefined, // Will be auto-generated
+      user_id: userId,
+      name: name,
+      package_name: `com.makevia.${name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+      status: 'draft' as const,
+      created_at: undefined,
+      updated_at: undefined,
+    };
+
+    const { data: clonedApp, error: cloneError } = await supabase.serviceClient
+      .from('apps')
+      .insert(clonedAppData)
+      .select()
+      .single();
+
+    if (cloneError) {
+      logger.error('Error cloning app:', cloneError);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to clone app',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Clone pages and components (simplified version)
+    const { data: sourcePages } = await supabase.serviceClient
+      .from('app_pages')
+      .select('*')
+      .eq('app_id', sourceAppId);
+
+    if (sourcePages && sourcePages.length > 0) {
+      const clonedPages = sourcePages.map(page => ({
+        ...page,
+        id: undefined,
+        app_id: clonedApp.id,
+        created_at: undefined,
+        updated_at: undefined,
+      }));
+
+      await supabase.serviceClient
+        .from('app_pages')
+        .insert(clonedPages);
+    }
+
+    res.status(201).json({
+      success: true,
+      data: clonedApp,
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+/**
+ * DELETE /api/apps/:id
+ * Delete an app
+ */
+router.delete('/:id',
+  rateLimits.api,
+  asyncHandler(async (req, res) => {
+    const userId = req.user.id;
+    const { id: appId } = req.params;
+
+    // Verify app ownership
+    const { data: app, error: fetchError } = await supabase.serviceClient
+      .from('apps')
+      .select('*')
+      .eq('id', appId)
+      .eq('user_id', userId) // Only owner can delete
+      .single();
+
+    if (fetchError || !app) {
+      res.status(404).json({
+        success: false,
+        error: 'App not found',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const { error } = await supabase.serviceClient
+      .from('apps')
+      .delete()
+      .eq('id', appId);
+
+    if (error) {
+      logger.error('Error deleting app:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to delete app',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -258,194 +729,35 @@ router.delete('/:id',
   })
 );
 
-// Duplicate app
-router.post('/:id/duplicate',
-  requireAuth,
-  requireOwnership('app'),
-  rateLimits.appCreation,
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { id } = req.params;
-    const { name } = req.body;
-
-    const originalApp = await supabase.getAppById(id, user.id);
-    if (!originalApp) {
-      throw NotFoundError('App');
+// Handle multer errors
+router.use((error: any, req: any, res: any, next: any) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        error: 'App icon file size exceeds 5MB limit',
+        code: 'FILE_TOO_LARGE',
+        timestamp: new Date().toISOString(),
+      });
     }
-
-    // Check user's app limit
-    const userApps = await supabase.getUserApps(user.id, 1000);
-    const subscription = req.subscription;
-    const appLimit = subscription?.apps_limit || 1;
-
-    if (userApps.length >= appLimit) {
-      throw ConflictError(`App limit reached. Your ${subscription?.tier || 'free'} plan allows ${appLimit} apps.`);
-    }
-
-    const duplicatedAppData: Omit<App, 'id' | 'created_at' | 'updated_at'> = {
-      ...originalApp,
-      name: name || `${originalApp.name} (Copy)`,
-      package_name: generatePackageName(name || `${originalApp.name} Copy`),
-      status: 'draft',
-      preview_count: 0,
-      build_count: 0,
-      last_previewed_at: undefined,
-      last_built_at: undefined,
-      metadata: {
-        ...originalApp.metadata,
-        duplicated_from: originalApp.id,
-        created_from: 'duplication',
-      },
-    };
-
-    const newApp = await supabase.createApp(duplicatedAppData);
-
-    // Duplicate screens as well
-    const originalScreens = await supabase.getAppScreens(id);
-    for (const screen of originalScreens) {
-      const duplicatedScreenData: Omit<Screen, 'id' | 'created_at' | 'updated_at'> = {
-        ...screen,
-        app_id: newApp.id,
-        version: 1,
-      };
-      await supabase.createScreen(duplicatedScreenData);
-    }
-
-    logger.info(`Duplicated app ${id} to ${newApp.id} for user ${user.id}`);
-
-    res.status(201).json({
-      success: true,
-      data: newApp,
-      message: 'App duplicated successfully',
+    return res.status(400).json({
+      success: false,
+      error: `File upload error: ${error.message}`,
+      code: error.code,
       timestamp: new Date().toISOString(),
     });
-  })
-);
-
-// Get app screens
-router.get('/:id/screens',
-  requireAuth,
-  requireOwnership('app'),
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const { id } = req.params;
-
-    const screens = await supabase.getAppScreens(id);
-
-    res.json({
-      success: true,
-      data: screens,
+  }
+  
+  if (error.message === 'Only image files are allowed for app icons') {
+    return res.status(400).json({
+      success: false,
+      error: error.message,
+      code: 'INVALID_FILE_TYPE',
       timestamp: new Date().toISOString(),
     });
-  })
-);
-
-// Create screen in app
-router.post('/:id/screens',
-  requireAuth,
-  requireOwnership('app'),
-  rateLimits.screenCreation,
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const user = req.user!;
-    const { id: appId } = req.params;
-    const { name, description, screen_type, canvas_position } = req.body;
-
-    // Validate required fields
-    if (!name || typeof name !== 'string') {
-      throw ValidationError('Screen name is required');
-    }
-
-    if (!screen_type || !['page', 'modal', 'bottom_sheet', 'dialog'].includes(screen_type)) {
-      throw ValidationError('Valid screen type is required');
-    }
-
-    // Check screen limit
-    const existingScreens = await supabase.getAppScreens(appId);
-    const subscription = req.subscription;
-    const screenLimit = subscription?.screens_limit || 5; // Free tier limit
-
-    if (existingScreens.length >= screenLimit) {
-      throw ConflictError(`Screen limit reached. Your ${subscription?.tier || 'free'} plan allows ${screenLimit} screens per app.`);
-    }
-
-    const screenData: Omit<Screen, 'id' | 'created_at' | 'updated_at'> = {
-      app_id: appId,
-      name: name.trim(),
-      description: description?.trim(),
-      screen_type,
-      ui_structure: { type: 'Container', children: [] },
-      styling: { backgroundColor: '#FFFFFF' },
-      logic: { state: {}, actions: {} },
-      canvas_x: canvas_position?.x || 0,
-      canvas_y: canvas_position?.y || 0,
-      canvas_width: 375,
-      canvas_height: 812,
-      is_start_screen: existingScreens.length === 0, // First screen is start screen
-      requires_auth: false,
-      config: {},
-      version: 1,
-    };
-
-    const newScreen = await supabase.createScreen(screenData);
-
-    logger.info(`Created screen ${newScreen.id} in app ${appId} for user ${user.id}`);
-
-    res.status(201).json({
-      success: true,
-      data: newScreen,
-      message: 'Screen created successfully',
-      timestamp: new Date().toISOString(),
-    });
-  })
-);
-
-// Get public app (for sharing)
-router.get('/public/:id', 
-  optionalAuth,
-  asyncHandler(async (req: AuthenticatedRequest, res) => {
-    const { id } = req.params;
-
-    const app = await supabase.getAppById(id);
-    if (!app || (!app.is_public && app.visibility === 'private')) {
-      throw NotFoundError('App not found or not public');
-    }
-
-    // Return only public information
-    const publicApp = {
-      id: app.id,
-      name: app.name,
-      description: app.description,
-      version: app.version,
-      status: app.status,
-      icon_url: app.icon_url,
-      primary_color: app.primary_color,
-      theme_mode: app.theme_mode,
-      preview_count: app.preview_count,
-      created_at: app.created_at,
-      updated_at: app.updated_at,
-    };
-
-    res.json({
-      success: true,
-      data: publicApp,
-      timestamp: new Date().toISOString(),
-    });
-  })
-);
-
-// Helper functions
-function isValidHexColor(color: string): boolean {
-  return /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/.test(color);
-}
-
-function isValidPackageName(packageName: string): boolean {
-  return /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(packageName);
-}
-
-function generatePackageName(appName: string): string {
-  const sanitized = appName.toLowerCase()
-    .replace(/[^a-z0-9]/g, '')
-    .substring(0, 20);
-  return `com.makevia.${sanitized}`;
-}
+  }
+  
+  next(error);
+});
 
 export default router;

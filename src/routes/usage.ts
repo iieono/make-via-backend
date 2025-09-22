@@ -26,16 +26,23 @@ router.get('/', requireAuth, asyncHandler(async (req: AuthenticatedRequest, res)
     totalScreens += screens.length;
   }
 
-  // Build usage statistics
+  // Build usage statistics - Credit-based system
   const usage: UsageStats = {
-    claude_generations_used: subscription?.claude_usage_count || 0,
-    claude_generations_limit: subscription?.claude_usage_limit || 10,
+    // Credit-based AI usage
+    credits_available: subscription?.available_credits || 0,
+    credits_used: subscription?.credits_used_this_period || 0,
+    credits_limit: subscription?.available_credits + subscription?.credits_used_this_period || 100,
+    
+    // App and screen limits remain the same
     apps_created: apps.length,
     apps_limit: subscription?.apps_limit || 1,
     screens_created: totalScreens,
     screens_limit: subscription?.screens_limit || 5,
+    
+    // Period information
     period_start: subscription?.current_period_start || new Date().toISOString(),
     period_end: subscription?.current_period_end || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    credits_reset_date: subscription?.credits_reset_date || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
   };
 
   res.json({
@@ -78,9 +85,10 @@ router.get('/detailed', requireAuth, asyncHandler(async (req: AuthenticatedReque
   const totalPreviews = appUsage.reduce((sum, app) => sum + app.preview_count, 0);
   const totalBuilds = appUsage.reduce((sum, app) => sum + app.build_count, 0);
 
-  // Build limits based on subscription tier
+  // Build limits based on subscription tier - Credit system
+  const creditLimit = subscription?.available_credits + subscription?.credits_used_this_period || 100;
   const limits = {
-    claude_generations: subscription?.claude_usage_limit || 10,
+    credits: creditLimit,
     apps: subscription?.apps_limit || 1,
     screens: subscription?.screens_limit || 5,
   };
@@ -88,12 +96,17 @@ router.get('/detailed', requireAuth, asyncHandler(async (req: AuthenticatedReque
   const detailedUsage = {
     summary: {
       tier: subscription?.tier || 'free',
-      claude_generations_used: subscription?.claude_usage_count || 0,
-      claude_generations_remaining: Math.max(0, limits.claude_generations - (subscription?.claude_usage_count || 0)),
+      // Credit-based metrics
+      credits_available: subscription?.available_credits || 0,
+      credits_used: subscription?.credits_used_this_period || 0,
+      credits_limit: creditLimit,
+      credits_remaining: subscription?.available_credits || 0,
+      // Resource metrics
       apps_created: apps.length,
       apps_remaining: Math.max(0, limits.apps - apps.length),
       screens_created: totalScreens,
       screens_remaining: Math.max(0, limits.screens - totalScreens),
+      // Activity metrics
       total_previews: totalPreviews,
       total_builds: totalBuilds,
     },
@@ -101,6 +114,7 @@ router.get('/detailed', requireAuth, asyncHandler(async (req: AuthenticatedReque
     period: {
       start: subscription?.current_period_start || new Date().toISOString(),
       end: subscription?.current_period_end || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      credits_reset_date: subscription?.credits_reset_date || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
     },
     apps: appUsage,
   };
@@ -151,25 +165,36 @@ router.get('/alerts', requireAuth, asyncHandler(async (req: AuthenticatedRequest
   const alerts = [];
 
   if (subscription) {
-    // Check Claude usage
-    const claudeUsagePercent = (subscription.claude_usage_count / subscription.claude_usage_limit) * 100;
-    if (claudeUsagePercent >= 90) {
+    // Check credit usage - Credit-based system
+    const totalCredits = subscription.available_credits + subscription.credits_used_this_period;
+    const creditUsagePercent = totalCredits > 0 ? (subscription.credits_used_this_period / totalCredits) * 100 : 0;
+    
+    if (subscription.available_credits <= 10) {
+      alerts.push({
+        type: 'error',
+        category: 'credit_usage',
+        message: `Only ${subscription.available_credits} credits remaining`,
+        remaining: subscription.available_credits,
+        limit: totalCredits,
+        action: 'Upgrade your plan or wait for credit renewal to continue using AI features',
+      });
+    } else if (creditUsagePercent >= 90) {
       alerts.push({
         type: 'warning',
-        category: 'claude_usage',
-        message: `You've used ${claudeUsagePercent.toFixed(0)}% of your AI generations this billing period`,
-        remaining: subscription.claude_usage_limit - subscription.claude_usage_count,
-        limit: subscription.claude_usage_limit,
-        action: 'Consider upgrading your plan or wait for next billing period',
+        category: 'credit_usage',
+        message: `You've used ${creditUsagePercent.toFixed(0)}% of your credits this billing period`,
+        remaining: subscription.available_credits,
+        limit: totalCredits,
+        action: 'Consider upgrading your plan or monitor usage carefully',
       });
-    } else if (claudeUsagePercent >= 75) {
+    } else if (creditUsagePercent >= 75) {
       alerts.push({
         type: 'info',
-        category: 'claude_usage',
-        message: `You've used ${claudeUsagePercent.toFixed(0)}% of your AI generations this billing period`,
-        remaining: subscription.claude_usage_limit - subscription.claude_usage_count,
-        limit: subscription.claude_usage_limit,
-        action: 'Monitor your usage to avoid hitting limits',
+        category: 'credit_usage',
+        message: `You've used ${creditUsagePercent.toFixed(0)}% of your credits this billing period`,
+        remaining: subscription.available_credits,
+        limit: totalCredits,
+        action: 'Monitor your usage to avoid running out of credits',
       });
     }
   }
@@ -220,24 +245,27 @@ router.get('/recommendations', requireAuth, asyncHandler(async (req: Authenticat
   // Get user's apps and usage patterns
   const apps = await supabase.getUserApps(user.id, 1000);
   
-  // Analyze usage patterns and provide recommendations
+  // Analyze usage patterns and provide recommendations - Credit system
   if (subscription?.tier === 'free') {
     if (apps.length >= 1) {
       recommendations.push({
         type: 'upgrade',
-        title: 'Upgrade to Pro for More Apps',
-        description: 'Create up to 10 apps with Pro plan',
-        action: 'upgrade_to_pro',
+        title: 'Upgrade to Creator for More Apps',
+        description: 'Create up to 10 apps with Creator plan',
+        action: 'upgrade_to_creator',
         priority: 'high',
       });
     }
 
-    if ((subscription.claude_usage_count / subscription.claude_usage_limit) > 0.8) {
+    const totalCredits = subscription.available_credits + subscription.credits_used_this_period;
+    const creditUsagePercent = totalCredits > 0 ? (subscription.credits_used_this_period / totalCredits) : 0;
+    
+    if (creditUsagePercent > 0.8 || subscription.available_credits < 20) {
       recommendations.push({
         type: 'upgrade',
-        title: 'Need More AI Generations?',
-        description: 'Pro plan includes 500 AI generations per month',
-        action: 'upgrade_to_pro',
+        title: 'Need More Credits?',
+        description: 'Creator plan includes 2,000 credits per month',
+        action: 'upgrade_to_creator',
         priority: 'medium',
       });
     }
